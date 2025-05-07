@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "a2a-mcp-translator"
+version = "0.1.0"
+description = "A2A Gateway Agent for bridging A2A and MCP protocols."
+readme = "README.md"
+requires-python = ">=3.12" # 同时满足 A2A (>=3.12) 和 MCP SDK (>=3.10) 的要求
+license = {text = "MIT"} # 假设是 MIT，请替换为实际的许可证
+authors = [
+    {name = "THINKER-ONLY", email = "lzysunprince@gmail.com"},
+]
+
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    # "Programming Language :: Python :: 3.11", # 如果要严格 >=3.12, 3.11 不应在此
+    # "Programming Language :: Python :: 3.10", # 如果要严格 >=3.12, 3.10 不应在此
+    "License :: OSI Approved :: MIT License", # 对应上面的 license.text
+    "Operating System :: OS Independent",
+    "Development Status :: 3 - Alpha", # 初始开发阶段
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Software Development :: Könstliche Intelligenz", # AI
+    "Topic :: Software Development :: Multi-Agent Systems", # MAS
+]
+
+dependencies = [
+    "httpx[http2,brotli]>=0.25.0", # 用于异步 HTTP 请求
+    "pydantic>=2.0",             # A2A 和 MCP 都用 Pydantic
+    "click>=8.0",                # 用于 __main__.py 的命令行接口 (如果使用)
+    "python-dotenv>=1.0.0",      # 用于从 .env 文件加载配置 (如果使用)
+    "uvicorn[standard]>=0.20.0", # ASGI 服务器，A2AServer 依赖
+    "starlette>=0.25.0",         # ASGI 框架，A2AServer 依赖
+    "sse-starlette>=1.0.0",      # 用于 SSE 支持, A2AServer 依赖
+    # 注意: 对本地 @A2A/samples/python/common 和 @python-sdk/src/mcp 的依赖
+    # 目前假定通过 PYTHONPATH 环境变量使其可导入，或者通过本地可编辑安装。
+    # 如果它们作为包发布，则应在此处列出其包名和版本。
+]
+
+[project.urls]
+Homepage = "your_project_homepage_url" # 例如 GitHub 仓库链接
+Documentation = "your_project_docs_url"
+Repository = "your_project_repo_url"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio", # 支持异步测试
+    "ruff>=0.1.0",    # Linter 和 Formatter
+    "mypy>=1.0",      # 类型检查
+    "pre-commit",     # 用于配置 pre-commit hooks
+]
+
+# 如果使用 setuptools 并且采用 src 布局，需要配置它在哪里找到包
+# 如果您的包名与 src 下的目录名不同，或者有更复杂的结构，可能需要调整
+# [tool.setuptools.packages.find]
+# where = ["src"]
+# include = ["translator*"]
+# exclude = ["tests*"]
+
+# [tool.setuptools.package-data] # 如果包内需要包含非代码文件
+# translator = ["py.typed"]
+
+[tool.ruff]
+line-length = 88
+select = ["E", "F", "W", "I", "UP", "PL", "PTH", "RUF"] # 启用一些常见的规则集
+ignore = ["E501"] # line too long, ruff format 会处理
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.12" # 与 requires-python 一致
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true # 初始可以设置为 true，特别是对于本地未规范打包的 common 和 mcp
+# 可以为特定模块关闭严格检查，例如如果外部库类型提示不完整
+# [[tool.mypy.overrides]]
+# module = [
+#     "common.*", # 假设 common 模块的类型提示可能不完整
+#     "mcp.*"     # 假设 mcp 模块的类型提示可能不完整
+# ]
+# ignore_missing_imports = true
