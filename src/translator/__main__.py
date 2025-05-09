@@ -2,6 +2,8 @@ import os
 import click
 import logging
 
+from dotenv import load_dotenv
+
 from common.server import A2AServer
 from common.types import AgentCard, AgentCapabilities, AgentSkill
 from .task_manager import MCPGatewayAgentTaskManager
