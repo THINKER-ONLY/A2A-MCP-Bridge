@@ -1,0 +1,1 @@
+# Vendored MCP protocol types 

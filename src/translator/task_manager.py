@@ -1,13 +1,28 @@
 import logging
 from typing import Any, Dict, Tuple, Optional, List
 from uuid import uuid4
+import httpx
 import json
 
-# 导入 MCP 类型定义
-from mcp import types as mcp_types
+# 从本地 vendor 目录导入 MCP 类型定义
+from vendor.MCP import types as mcp_types
 
-from common.server.task_manager import InMemoryTaskManager, TaskManagerError
-from common.types import (
+# 从本地 vendor 目录导入 A2A 类型定义
+from vendor.A2A.types import (
+    Artifact,
+    DataPart,
+    JSONRPCError,
+    Message,
+    SendTaskRequest,
+    SendTaskResponse,
+    Task,
+    TaskState,
+    TaskStatus,
+    TextPart,
+)
+
+from vendor.A2A.server.task_manager import InMemoryTaskManager, TaskManagerError
+from vendor.A2A.types import (
     Artifact,
     DataPart,
     JSONRPCError,

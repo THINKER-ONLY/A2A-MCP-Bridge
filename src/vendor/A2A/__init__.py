@@ -1,0 +1,1 @@
+# Vendored A2A protocol types 

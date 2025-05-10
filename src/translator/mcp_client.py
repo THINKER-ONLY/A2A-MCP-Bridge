@@ -1,6 +1,5 @@
 import httpx
 from typing import Dict, Any, Optional
-from mcp import types as mcp_types
 
 async def send_mcp_request(
     target_url: str,  # 完整的 URL，包括路径

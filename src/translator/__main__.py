@@ -4,8 +4,8 @@ import logging
 
 from dotenv import load_dotenv
 
-from common.server import A2AServer
-from common.types import AgentCard, AgentCapabilities, AgentSkill
+from vendor.A2A.server import A2AServer
+from vendor.A2A.types import AgentCard, AgentCapabilities, AgentSkill
 from .task_manager import MCPGatewayAgentTaskManager
 
 load_dotenv()
