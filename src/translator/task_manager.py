@@ -1,5 +1,10 @@
 import logging
 from typing import Any, Dict, Tuple, Optional, List
+from uuid import uuid4
+import json
+
+# 导入 MCP 类型定义
+from mcp import types as mcp_types
 
 from common.server.task_manager import InMemoryTaskManager, TaskManagerError
 from common.types import (
@@ -89,7 +94,7 @@ class MCPGatewayAgentTaskManager(InMemoryTaskManager):
         # 输出: final_task_status, list_of_artifacts
         logger.info(f"任务 [{task_id}]: MCP 调用成功 (或 MCP 返回了结构化错误)。正在格式化 A2A 结果。")
         final_task_status, final_artifacts = self._format_a2a_result_from_mcp_response(
-            mcp_response_payload=mcp_response_payload, # 这个字典包含来自 MCP 的 "result" 或 "error"
+            mcp_response_data=mcp_response_payload, # 这个字典包含来自 MCP 的 "result" 或 "error"
             mcp_request_id_echo=mcp_request_id_sent
         )
         
@@ -115,33 +120,227 @@ class MCPGatewayAgentTaskManager(InMemoryTaskManager):
             - "mcp_request_path": str (可选, 默认为 "/messages/")
             - "mcp_request_id": str | int (可选)
         """
-        pass
+        try:
+            if not message.parts or len(message.parts) == 0:
+                return None, JSONRPCError(
+                    code=-32602,
+                    message="消息必须包含至少一个部分",
+                    data={"detail": "Message must contain at least one part"}
+                )
+
+            first_part = message.parts[0]
+            if not isinstance(first_part, DataPart):
+                return None, JSONRPCError(
+                    code=-32602,
+                    message="第一个部分必须是 DataPart 类型",
+                    data={"detail": "First part must be a DataPart"}
+                )
+            
+            data = first_part.data
+            required_fields = ["mcp_target_url", "mcp_method", "mcp_params"]
+            for field in required_fields:
+                if field not in data:
+                    return None, JSONRPCError(
+                        code=-32602,
+                        message=f"缺少必需字段: {field}",
+                        data={"detail": f"Missing required field: {field}"}
+                    )
+                
+            if not isinstance(data["mcp_target_url"], str):
+                return None, JSONRPCError(
+                    code=-32602,
+                    message="mcp_target_url 必须是字符串",
+                    data={"detail": "mcp_target_url must be a string"}
+                )
+            
+            if not isinstance(data["mcp_method"], str):
+                return None, JSONRPCError(
+                    code=-32602,
+                    message="mcp_method 必须是字符串",
+                    data={"detail": "mcp_method must be a string"}
+                )
+            
+            if not isinstance(data["mcp_params"], dict):
+                return None, JSONRPCError(
+                    code=-32602,
+                    message="mcp_params 必须是字典",
+                    data={"detail": "mcp_params must be a dictionary"}
+                )
+            
+            params = {
+                "mcp_target_url": data["mcp_target_url"],
+                "mcp_method": data["mcp_method"],
+                "mcp_params": data["mcp_params"],
+                "mcp_request_path": data.get("mcp_request_path", "/messages/"),
+                "mcp_request_id": data.get("mcp_request_id")
+            }
+            return params, None
+
+        except Exception as e:
+            logger.error(f"解析 A2A 输入时发生错误: {str(e)}", exc_info=True)
+            return None, JSONRPCError(
+                code=-32603,
+                message="解析 A2A 输入时发生内部错误",
+                data={"detail": str(e)}
+            )
+            
 
     def _build_mcp_request_body(self, method: str, params: Dict[str, Any], request_id: Optional[str | int]) -> Dict[str, Any]:
         """
-        构造标准的 JSON-RPC 2.0 请求体 (作为字典)。
+        构造标准的 JSON-RPC 2.0 请求体 (作为字典)，使用 mcp_types。
         """
-        pass
+        if request_id is None:
+            request_id = str(uuid4())
+        
+        mcp_req_obj = mcp_types.JSONRPCRequest(
+            jsonrpc="2.0",
+            id=request_id,
+            method=method,
+            params=params
+        )
+        # exclude_none=True 确保可选字段为 None 时不包含在输出字典中
+        return mcp_req_obj.model_dump(exclude_none=True)
 
     async def _execute_mcp_call(self, target_base_url: str, request_path: str, mcp_request_body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[JSONRPCError]]:
         """
         使用 mcp_client 发送 MCP 请求并处理 HTTP/网络错误。
-        返回 MCP 响应负载 (字典) 或一个用于 A2A 的 JSONRPCError。
+        返回 MCP 响应的 result 部分 (字典) 或一个用于 A2A 的 JSONRPCError。
         """
-        pass
+        url = f"{target_base_url.rstrip('/')}/{request_path.lstrip('/')}" # 使用 lstrip for request_path
+        try:
+            raw_response_dict = await send_mcp_request(url, mcp_request_body)
 
-    def _format_a2a_result_from_mcp_response(self, mcp_response_payload: Dict[str, Any], mcp_request_id_echo: Optional[str | int]) -> Tuple[TaskStatus, List[Artifact]]:
+            # 尝试将响应解析为 MCP JSON-RPC 错误或成功响应
+            # MCP 服务对于 JSON-RPC 级别的错误通常也返回 HTTP 200 OK
+            if "error" in raw_response_dict and "id" in raw_response_dict:
+                try:
+                    mcp_error_obj = mcp_types.JSONRPCError.model_validate(raw_response_dict)
+                    # 将 MCP SDK 的 ErrorData 转换为 A2A JSONRPCError
+                    return None, JSONRPCError(
+                        code=mcp_error_obj.error.code,
+                        message=mcp_error_obj.error.message,
+                        data=mcp_error_obj.error.data
+                    )
+                except Exception as val_err: # Pydantic validation error
+                    logger.warning(f"MCP响应看似错误, 但mcp_types.JSONRPCError验证失败: {val_err}. 回退到原始解析。URL: {url}")
+                    error_payload = raw_response_dict.get("error", {})
+                    return None, JSONRPCError(
+                        code=error_payload.get("code", mcp_types.INTERNAL_ERROR),
+                        message=error_payload.get("message", "未知的MCP错误结构"),
+                        data=error_payload.get("data")
+                    )
+            elif "result" in raw_response_dict and "id" in raw_response_dict:
+                try:
+                    mcp_success_obj = mcp_types.JSONRPCResponse.model_validate(raw_response_dict)
+                    # 返回 MCP 响应中的 'result' 部分，它本身应该是一个字典
+                    if isinstance(mcp_success_obj.result, dict):
+                        return mcp_success_obj.result, None
+                    else:
+                        # 如果 result 不是字典，可能需要根据具体业务调整
+                        # 例如，如果允许其他类型，或将其包装在字典中
+                        logger.warning(f"MCP响应的result字段不是预期的字典类型。URL: {url}, Result: {mcp_success_obj.result}")
+                        # 作为一种容错，如果result不是None，但也不是字典，我们将其作为data传递，但这可能需要进一步处理
+                        return {"non_dict_result": mcp_success_obj.result} if mcp_success_obj.result is not None else {}, None
+                except Exception as val_err: # Pydantic validation error
+                    logger.warning(f"MCP成功响应验证失败: {val_err}. 直接返回原始字典。URL: {url}")
+                    # 如果验证失败，但包含 result，仍返回原始字典（这部分是传给 _format_a2a_result_from_mcp_response）
+                    return raw_response_dict, None 
+            else:
+                # 响应既不完全符合JSONRPCError也不完全符合JSONRPCResponse的结构，但HTTP成功
+                logger.warning(f"MCP响应结构未知，但HTTP调用成功。URL: {url}, Response: {raw_response_dict}")
+                # 仍然将其视为成功传递给格式化函数，让它决定如何处理
+                return raw_response_dict, None
+
+        except httpx.HTTPError as e:
+            error_message = str(e)
+            status_code = e.response.status_code if e.response else None
+            logger.error(f"MCP HTTPError (状态码: {status_code}) 调用 {url}: {error_message}", exc_info=True)
+            return None, JSONRPCError(
+                code=status_code or mcp_types.INTERNAL_ERROR, # 使用HTTP状态码或通用内部错误码
+                message=error_message, 
+                data={"details": f"MCP调用期间发生HTTP/网络层错误 (URL: {url})"}
+            )
+        except ValueError as e: # JSON decoding error from mcp_client
+            logger.error(f"MCP ValueError (JSON解码) 调用 {url}: {str(e)}", exc_info=True)
+            return None, JSONRPCError(
+                code=mcp_types.PARSE_ERROR,
+                message="MCP服务返回非JSON响应或格式错误的JSON。",
+                data={"details": str(e), "url": url}
+            )
+        except Exception as e: # Catch-all for other unexpected errors
+            logger.error(f"MCP调用期间发生意外错误 {url}: {str(e)}", exc_info=True)
+            return None, JSONRPCError(
+                code=mcp_types.INTERNAL_ERROR,
+                message="与MCP服务通信时发生意外错误。",
+                data={"details": str(e), "url": url}
+            )
+
+    def _format_a2a_result_from_mcp_response(self, mcp_response_data: Dict[str, Any], mcp_request_id_echo: Optional[str | int]) -> Tuple[TaskStatus, List[Artifact]]:
         """
-        将 MCP JSON-RPC 响应 (其本身可能是成功或 MCP 错误对象) 格式化为 A2A TaskStatus 和 Artifacts。
-        输出 DataPart 结构请参考 DESIGN.md。
-        """   
-        pass
+        将 MCP 服务的响应数据 (通常是JSON-RPC的result字段内容, 或包含error的完整JSON-RPC结构) 
+        格式化为 A2A TaskStatus 和 Artifacts。
+        """
+        actual_data_part = DataPart(
+            data=mcp_response_data,
+            metadata={"mcp_request_id_echo": str(mcp_request_id_echo) if mcp_request_id_echo is not None else None}
+        )
+
+        result_artifact = Artifact(
+            name="MCP Service Response",
+            description="Payload received from the MCP service.",
+            parts=[actual_data_part]
+        )
+
+        status_message_text = "MCP request processed successfully."
+        if "error" in mcp_response_data:
+            mcp_error_obj = mcp_response_data.get("error", {})
+            status_message_text = f"MCP service returned an error: {mcp_error_obj.get('message', 'Unknown MCP error')}"
+
+        status_message = Message(
+            role="agent",
+            ports=[TextPart(text=status_message_text)]
+        )
+
+        final_task_status = TaskStatus(
+            state=TaskState.COMPLETED,
+            message=status_message    
+        )
+
+        return final_task_status, [result_artifact]
 
     def _format_a2a_result_on_error(self, mcp_call_error_details: Dict[str, Any], mcp_request_id_echo: Optional[str | int]) -> Tuple[TaskStatus, List[Artifact]]:
         """
         当发生直接通信错误 (不是 MCP 返回的错误) 时，格式化 A2A TaskStatus 和 Artifacts。
+        mcp_call_error_details 是 JSONRPCError.model_dump() 的结果。
         """
-        pass
+        error_code = mcp_call_error_details.get("code", mcp_types.INTERNAL_ERROR) # 修正：从 "code" 键获取
+        error_message_str = mcp_call_error_details.get("message", "Unknown communication error with MCP service")
+        error_data_payload = mcp_call_error_details.get("data") 
+
+        error_detail_data_for_part = {
+            "source_error": mcp_call_error_details,
+            "mcp_request_id_echo": str(mcp_request_id_echo) if mcp_request_id_echo is not None else None
+        }
+        
+        error_data_part = DataPart(data=error_detail_data_for_part)
+        
+        error_artifact = Artifact(
+            name="MCP Call Communication Error",
+            description=f"Failed to communicate with MCP service: {error_message_str}",
+            parts=[error_data_part]
+        )
+
+        status_message = Message(
+            role="agent",
+            parts=[TextPart(text=f"Failed to execute MCP call: {error_message_str}")]
+        )
+
+        final_task_status = TaskStatus(
+            state=TaskState.FAILED,
+            message=status_message
+        )
+        
+        return final_task_status, [error_artifact]
 
     
     
