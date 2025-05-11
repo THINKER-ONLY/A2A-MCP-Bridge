@@ -1,8 +1,7 @@
 import logging
-from typing import Any, Dict, Tuple, Optional, List
+from typing import Any, Dict, Tuple, Optional, List, Union, AsyncIterable
 from uuid import uuid4
 import httpx
-import json
 
 # 从本地 vendor 目录导入 MCP 类型定义
 from vendor.MCP import types as mcp_types
@@ -19,20 +18,13 @@ from vendor.A2A.types import (
     TaskState,
     TaskStatus,
     TextPart,
+    SendTaskStreamingRequest,
+    SendTaskStreamingResponse,
+    JSONRPCResponse as A2AJSONRPCResponse 
 )
 
-from vendor.A2A.server.task_manager import InMemoryTaskManager, TaskManagerError
-from vendor.A2A.types import (
-    Artifact,
-    DataPart,
-    JSONRPCError,
-    Message,
-    SendTaskRequest,
-    SendTaskResponse,
-    Task,
-    TaskState,
-    TaskStatus,
-)
+from vendor.A2A.server.task_manager import InMemoryTaskManager
+from vendor.A2A.server.utils import new_not_implemented_error
 
 from .mcp_client import send_mcp_request
 
@@ -221,9 +213,17 @@ class MCPGatewayAgentTaskManager(InMemoryTaskManager):
         使用 mcp_client 发送 MCP 请求并处理 HTTP/网络错误。
         返回 MCP 响应的 result 部分 (字典) 或一个用于 A2A 的 JSONRPCError。
         """
-        url = f"{target_base_url.rstrip('/')}/{request_path.lstrip('/')}" # 使用 lstrip for request_path
+        # 确保 target_base_url 总是以单个斜杠结尾，然后附加 request_path
+        # 这有助于避免双斜杠或缺少斜杠的问题
+        if not target_base_url.endswith("/"):
+            target_base_url += "/"
+        
+        # request_path 通常以 / 开头，但也可能不是，所以 lstrip 一下以防万一
+        # 如果 request_path 为空或 "/"，urljoin 的行为可能更可预测，但这里简化处理
+        full_mcp_url = target_base_url + request_path.lstrip("/")
+
         try:
-            raw_response_dict = await send_mcp_request(url, mcp_request_body)
+            raw_response_dict = await send_mcp_request(full_mcp_url, mcp_request_body)
 
             # 尝试将响应解析为 MCP JSON-RPC 错误或成功响应
             # MCP 服务对于 JSON-RPC 级别的错误通常也返回 HTTP 200 OK
@@ -237,7 +237,7 @@ class MCPGatewayAgentTaskManager(InMemoryTaskManager):
                         data=mcp_error_obj.error.data
                     )
                 except Exception as val_err: # Pydantic validation error
-                    logger.warning(f"MCP响应看似错误, 但mcp_types.JSONRPCError验证失败: {val_err}. 回退到原始解析。URL: {url}")
+                    logger.warning(f"MCP响应看似错误, 但mcp_types.JSONRPCError验证失败: {val_err}. 回退到原始解析。URL: {full_mcp_url}")
                     error_payload = raw_response_dict.get("error", {})
                     return None, JSONRPCError(
                         code=error_payload.get("code", mcp_types.INTERNAL_ERROR),
@@ -253,41 +253,41 @@ class MCPGatewayAgentTaskManager(InMemoryTaskManager):
                     else:
                         # 如果 result 不是字典，可能需要根据具体业务调整
                         # 例如，如果允许其他类型，或将其包装在字典中
-                        logger.warning(f"MCP响应的result字段不是预期的字典类型。URL: {url}, Result: {mcp_success_obj.result}")
+                        logger.warning(f"MCP响应的result字段不是预期的字典类型。URL: {full_mcp_url}, Result: {mcp_success_obj.result}")
                         # 作为一种容错，如果result不是None，但也不是字典，我们将其作为data传递，但这可能需要进一步处理
                         return {"non_dict_result": mcp_success_obj.result} if mcp_success_obj.result is not None else {}, None
                 except Exception as val_err: # Pydantic validation error
-                    logger.warning(f"MCP成功响应验证失败: {val_err}. 直接返回原始字典。URL: {url}")
+                    logger.warning(f"MCP成功响应验证失败: {val_err}. 直接返回原始字典。URL: {full_mcp_url}")
                     # 如果验证失败，但包含 result，仍返回原始字典（这部分是传给 _format_a2a_result_from_mcp_response）
                     return raw_response_dict, None 
             else:
                 # 响应既不完全符合JSONRPCError也不完全符合JSONRPCResponse的结构，但HTTP成功
-                logger.warning(f"MCP响应结构未知，但HTTP调用成功。URL: {url}, Response: {raw_response_dict}")
+                logger.warning(f"MCP响应结构未知，但HTTP调用成功。URL: {full_mcp_url}, Response: {raw_response_dict}")
                 # 仍然将其视为成功传递给格式化函数，让它决定如何处理
                 return raw_response_dict, None
 
         except httpx.HTTPError as e:
             error_message = str(e)
             status_code = e.response.status_code if e.response else None
-            logger.error(f"MCP HTTPError (状态码: {status_code}) 调用 {url}: {error_message}", exc_info=True)
+            logger.error(f"MCP HTTPError (状态码: {status_code}) 调用 {full_mcp_url}: {error_message}", exc_info=True)
             return None, JSONRPCError(
                 code=status_code or mcp_types.INTERNAL_ERROR, # 使用HTTP状态码或通用内部错误码
                 message=error_message, 
-                data={"details": f"MCP调用期间发生HTTP/网络层错误 (URL: {url})"}
+                data={"details": f"MCP调用期间发生HTTP/网络层错误 (URL: {full_mcp_url})"}
             )
         except ValueError as e: # JSON decoding error from mcp_client
-            logger.error(f"MCP ValueError (JSON解码) 调用 {url}: {str(e)}", exc_info=True)
+            logger.error(f"MCP ValueError (JSON解码) 调用 {full_mcp_url}: {str(e)}", exc_info=True)
             return None, JSONRPCError(
                 code=mcp_types.PARSE_ERROR,
                 message="MCP服务返回非JSON响应或格式错误的JSON。",
-                data={"details": str(e), "url": url}
+                data={"details": str(e), "url": full_mcp_url}
             )
         except Exception as e: # Catch-all for other unexpected errors
-            logger.error(f"MCP调用期间发生意外错误 {url}: {str(e)}", exc_info=True)
+            logger.error(f"MCP调用期间发生意外错误 {full_mcp_url}: {str(e)}", exc_info=True)
             return None, JSONRPCError(
                 code=mcp_types.INTERNAL_ERROR,
                 message="与MCP服务通信时发生意外错误。",
-                data={"details": str(e), "url": url}
+                data={"details": str(e), "url": full_mcp_url}
             )
 
     def _format_a2a_result_from_mcp_response(self, mcp_response_data: Dict[str, Any], mcp_request_id_echo: Optional[str | int]) -> Tuple[TaskStatus, List[Artifact]]:
@@ -356,6 +356,18 @@ class MCPGatewayAgentTaskManager(InMemoryTaskManager):
         )
         
         return final_task_status, [error_artifact]
+
+    async def on_send_task_subscribe(
+        self, request: SendTaskStreamingRequest
+    ) -> Union[AsyncIterable[SendTaskStreamingResponse], A2AJSONRPCResponse]:
+        """
+        此 Agent 不支持流式任务订阅。
+        """
+        logger.warning(
+            f"任务 [{request.params.id}] (会话 [{request.params.sessionId}]): "
+            f"尝试订阅流式任务，但此 Agent 不支持。"
+        )
+        return new_not_implemented_error(request.id)
 
     
     

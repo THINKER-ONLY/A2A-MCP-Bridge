@@ -84,3 +84,17 @@ ignore_missing_imports = true # 初始可以设置为 true，特别是对于本�
 #     "mcp.*"     # 假设 mcp 模块的类型提示可能不完整
 # ]
 # ignore_missing_imports = true
+
+# --- BEGIN ADDED PYTEST CONFIGURATION ---
+[tool.pytest.ini_options]
+pythonpath = [
+  ".",  # 项目根目录 (Adapter)
+  "src" # src 目录
+]
+markers = [
+  "asyncio: mark the test as a coroutine.", # 注册 asyncio 标记
+]
+testpaths = [
+    "tests" # 指定测试文件所在的目录
+]
+# --- END ADDED PYTEST CONFIGURATION ---
