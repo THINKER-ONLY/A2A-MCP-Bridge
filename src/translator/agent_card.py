@@ -1,4 +1,4 @@
-from vendor.A2A.types import AgentCard, AgentCapabilities, AgentSkill, AgentProvider
+from src.vendor.A2A.types import AgentCard, AgentCapabilities, AgentSkill, AgentProvider
 
 DEFAULT_AGENT_VERSION = "0.1.0"
 

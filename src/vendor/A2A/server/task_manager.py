@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Union, AsyncIterable, List
+from typing import Union, AsyncIterable, List, Optional
 from ..types import Task
 from ..types import (
     JSONRPCResponse,
@@ -187,16 +187,17 @@ class InMemoryTaskManager(TaskManager):
         async with self.lock:
             task = self.tasks.get(task_send_params.id)
             if task is None:
+                history_message_data = task_send_params.message.model_dump()
                 task = Task(
                     id=task_send_params.id,
                     sessionId = task_send_params.sessionId,
-                    messages=[task_send_params.message],
                     status=TaskStatus(state=TaskState.SUBMITTED),
-                    history=[task_send_params.message],
+                    history=[history_message_data],
                 )
                 self.tasks[task_send_params.id] = task
             else:
-                task.history.append(task_send_params.message)
+                history_message_data = task_send_params.message.model_dump()
+                task.history.append(history_message_data)
 
             return task
 
@@ -225,7 +226,8 @@ class InMemoryTaskManager(TaskManager):
                     task.artifacts = []
                 task.artifacts.extend(artifacts)
 
-            return task
+            self.tasks[task_id] = task
+            return task.model_copy(deep=True)
 
     def append_task_history(self, task: Task, historyLength: int | None):
         new_task = task.model_copy()
@@ -274,4 +276,13 @@ class InMemoryTaskManager(TaskManager):
             async with self.subscriber_lock:
                 if task_id in self.task_sse_subscribers:
                     self.task_sse_subscribers[task_id].remove(sse_event_queue)
+
+    async def delete_task(self, task_id: str) -> Optional[Task]:
+        async with self.lock:
+            task = self.tasks.get(task_id)
+            if task is None:
+                return None
+
+            del self.tasks[task_id]
+            return task
 

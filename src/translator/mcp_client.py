@@ -30,27 +30,34 @@ async def send_mcp_request(
         **(headers or {})
     }
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         try:
             response = await client.post(
                 target_url,
                 json=mcp_json_rpc_request_dict,
-                headers=request_headers,
-                timeout=timeout
+                headers=request_headers
             )
             response.raise_for_status()
             return response.json()
         except httpx.HTTPError as e:
             # 如果是 HTTP 错误，尝试解析错误响应
-            if e.response is not None:
+            # 安全地访问 e.response
+            current_response = getattr(e, 'response', None)
+            if current_response is not None:
                 try:
-                    error_data = e.response.json()
-                    error_message = error_data.get('error', {}).get('message', str(e))
-                    raise httpx.HTTPError(
-                        f"HTTP {e.response.status_code}: {error_message}",
-                        request=e.request,
-                        response=e.response
-                    )
-                except ValueError:
-                    raise
-            raise
+                    error_data = current_response.json()
+                    # 尝试获取更详细的错误消息
+                    error_message_detail = error_data.get('error', {}).get('message', None)
+                    # 如果成功获取了详细消息，可以选择记录日志，但无论如何都重新抛出原始异常 e
+                    # 它已经包含了 request 和 response
+                    if error_message_detail:
+                        # 可选：在这里添加日志记录详细错误信息
+                        # logger.error(f"MCP HTTP Error {current_response.status_code} with detail: {error_message_detail}")
+                        pass 
+                    raise e # 重新抛出原始异常
+                except ValueError: # JSON decoding failed
+                    # 如果 JSON 解析失败，也重新抛出原始异常 e
+                    raise e
+            else:
+                # 如果原始异常没有 response (例如 ConnectError)，直接重新抛出
+                raise e

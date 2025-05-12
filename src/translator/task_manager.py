@@ -7,7 +7,7 @@ import httpx
 from vendor.MCP import types as mcp_types
 
 # 从本地 vendor 目录导入 A2A 类型定义
-from vendor.A2A.types import (
+from src.vendor.A2A.types import (
     Artifact,
     DataPart,
     JSONRPCError,
@@ -23,10 +23,10 @@ from vendor.A2A.types import (
     JSONRPCResponse as A2AJSONRPCResponse 
 )
 
-from vendor.A2A.server.task_manager import InMemoryTaskManager
-from vendor.A2A.server.utils import new_not_implemented_error
+from src.vendor.A2A.server.task_manager import InMemoryTaskManager
+from src.vendor.A2A.server.utils import new_not_implemented_error
 
-from .mcp_client import send_mcp_request
+from src.translator.mcp_client import send_mcp_request
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +37,35 @@ class MCPGatewayAgentTaskManager(InMemoryTaskManager):
     """
 
     async def on_send_task(self, request: SendTaskRequest) -> SendTaskResponse:
-        task_id = request.params.id
-        session_id = request.params.sessionId
+        # 步骤 0: 立即通过 upsert_task 创建或获取任务，确保它在后续操作中存在
+        # upsert_task 会处理任务的初始创建 (状态 SUBMITTED) 和存储，或获取现有任务
+        try:
+            # 我们期望 request.params (类型为 TaskSendParams) 中有所有需要的信息
+            # upsert_task 来自 InMemoryTaskManager
+            initial_task = await self.upsert_task(request.params)
+            task_id = initial_task.id
+            session_id = initial_task.sessionId
+        except Exception as e:
+            logger.error(f"在 upsert_task 时发生严重错误 (ID: {request.params.id}): {str(e)}", exc_info=True)
+            return SendTaskResponse(
+                id=request.id,
+                error=JSONRPCError(
+                    code=mcp_types.INTERNAL_ERROR,
+                    message="任务存储失败",
+                    data={"detail": str(e)}
+                ),
+                result=Task(
+                    id=request.params.id,
+                    sessionId=request.params.sessionId,
+                    status=TaskStatus(state=TaskState.FAILED, message=Message(role="agent", parts=[TextPart(text="任务初始存储失败。")])),
+                    history=[request.params.message.model_copy(deep=True) if request.params.message else Message(role="user", parts=[TextPart(text="<原始消息不可用>")])]
+                )
+            )
+
+        # incoming_message 仍然可以直接从 request.params.message 获取，供后续解析使用
         incoming_message = request.params.message
 
-        logger.info(f"任务 [{task_id}] (会话 [{session_id}]): 已接收。正在处理...")
+        logger.info(f"任务 [{task_id}] (会话 [{session_id}]): 已接收并初步存储。正在处理...")
         # ---------- 工作流步骤 ----------
 
         # 步骤 1: 解析并验证 A2A 输入
@@ -58,8 +82,8 @@ class MCPGatewayAgentTaskManager(InMemoryTaskManager):
                     parts=[DataPart(data={"error_summary": "无效的 A2A 任务输入。", "detail": extraction_error.model_dump()})],
                 )
             )
-            updated_task = await self.update_store(task_id, session_id, failed_status, [], incoming_message)
-            return SendTaskResponse(result=updated_task, error=extraction_error)
+            updated_task = await self.update_store(task_id, failed_status, [])
+            return SendTaskResponse(id=request.id, result=updated_task, error=extraction_error)
         
         mcp_target_url = parsed_input["mcp_target_url"]
         mcp_request_path = parsed_input["mcp_request_path"]
@@ -93,8 +117,8 @@ class MCPGatewayAgentTaskManager(InMemoryTaskManager):
                 mcp_call_error_details=mcp_call_error.model_dump(),
                 mcp_request_id_echo=mcp_request_id_sent
             )
-            updated_task = await self.update_store(task_id, session_id, failed_status, artifacts_with_error, incoming_message)
-            return SendTaskResponse(result=updated_task, error=mcp_call_error)
+            updated_task = await self.update_store(task_id, failed_status, artifacts_with_error)
+            return SendTaskResponse(id=request.id, result=updated_task, error=mcp_call_error)
         
         # 步骤 5: 从 MCP 响应格式化 A2A 任务结果
         # 目标: 将成功的 (或 MCP 层面错误的) mcp_response_payload 转换为 A2A TaskStatus 和 Artifacts。
@@ -109,12 +133,10 @@ class MCPGatewayAgentTaskManager(InMemoryTaskManager):
         logger.info(f"任务 [{task_id}]: 最终 A2A 状态: {final_task_status.state}。正在更新存储。")
         updated_task = await self.update_store(
             task_id,
-            session_id,
             final_task_status,
-            final_artifacts,
-            incoming_message
+            final_artifacts
         )
-        return SendTaskResponse(result=updated_task)
+        return SendTaskResponse(id=request.id, result=updated_task, error=None)
 
     def _parse_a2a_input(self, message: Message) -> Tuple[Optional[Dict[str, Any]], Optional[JSONRPCError]]:
         """
@@ -136,50 +158,77 @@ class MCPGatewayAgentTaskManager(InMemoryTaskManager):
                 )
 
             first_part = message.parts[0]
-            if not isinstance(first_part, DataPart):
+            
+            # 修改检查逻辑：
+            # 1. 检查 'type' 属性是否存在且等于 'data'
+            # 2. 检查 'data' 属性是否存在
+            part_type = getattr(first_part, 'type', None)
+            # first_part 可能没有 'data' 属性，即使 type 是 'data' (例如，如果它是一个不完整的模型)
+            # 所以我们同时检查 getattr(first_part, 'data', None) is not None
+            # 并且，即使 'data' 属性存在，它也必须是一个字典
+            first_part_data_attr = getattr(first_part, 'data', None)
+
+            if not (part_type == "data" and first_part_data_attr is not None and isinstance(first_part_data_attr, dict)):
                 return None, JSONRPCError(
                     code=-32602,
-                    message="第一个部分必须是 DataPart 类型",
-                    data={"detail": "First part must be a DataPart"}
+                    message="第一个部分必须是有效的 DataPart (type='data' 且其 'data' 字段为字典)",
+                    data={"detail": f"First part type was '{part_type}', data attribute present: {first_part_data_attr is not None}, data attribute is dict: {isinstance(first_part_data_attr, dict)}"}
                 )
             
-            data = first_part.data
+            # 现在 data_payload 是 first_part.data，并且我们知道它是一个字典
+            data_payload: Dict[str, Any] = first_part_data_attr
+            
             required_fields = ["mcp_target_url", "mcp_method", "mcp_params"]
             for field in required_fields:
-                if field not in data:
+                if field not in data_payload: # 检查 data_payload
                     return None, JSONRPCError(
                         code=-32602,
                         message=f"缺少必需字段: {field}",
                         data={"detail": f"Missing required field: {field}"}
                     )
                 
-            if not isinstance(data["mcp_target_url"], str):
+            if not isinstance(data_payload["mcp_target_url"], str):
                 return None, JSONRPCError(
                     code=-32602,
                     message="mcp_target_url 必须是字符串",
                     data={"detail": "mcp_target_url must be a string"}
                 )
             
-            if not isinstance(data["mcp_method"], str):
+            if not isinstance(data_payload["mcp_method"], str):
                 return None, JSONRPCError(
                     code=-32602,
                     message="mcp_method 必须是字符串",
                     data={"detail": "mcp_method must be a string"}
                 )
             
-            if not isinstance(data["mcp_params"], dict):
+            if not isinstance(data_payload["mcp_params"], dict):
                 return None, JSONRPCError(
                     code=-32602,
                     message="mcp_params 必须是字典",
                     data={"detail": "mcp_params must be a dictionary"}
                 )
             
+            # 检查可选字段的类型 (如果存在)
+            if "mcp_request_path" in data_payload and not isinstance(data_payload["mcp_request_path"], str):
+                return None, JSONRPCError(
+                    code=-32602,
+                    message="如果提供，mcp_request_path 必须是字符串",
+                    data={"detail": "mcp_request_path must be a string if provided"}
+                )
+
+            if "mcp_request_id" in data_payload and not isinstance(data_payload["mcp_request_id"], (str, int)):
+                 return None, JSONRPCError(
+                    code=-32602,
+                    message="如果提供，mcp_request_id 必须是字符串或整数",
+                    data={"detail": "mcp_request_id must be a string or integer if provided"}
+                )
+            
             params = {
-                "mcp_target_url": data["mcp_target_url"],
-                "mcp_method": data["mcp_method"],
-                "mcp_params": data["mcp_params"],
-                "mcp_request_path": data.get("mcp_request_path", "/messages/"),
-                "mcp_request_id": data.get("mcp_request_id")
+                "mcp_target_url": data_payload["mcp_target_url"],
+                "mcp_method": data_payload["mcp_method"],
+                "mcp_params": data_payload["mcp_params"],
+                "mcp_request_path": data_payload.get("mcp_request_path", "/messages/"),
+                "mcp_request_id": data_payload.get("mcp_request_id")
             }
             return params, None
 
@@ -230,20 +279,21 @@ class MCPGatewayAgentTaskManager(InMemoryTaskManager):
             if "error" in raw_response_dict and "id" in raw_response_dict:
                 try:
                     mcp_error_obj = mcp_types.JSONRPCError.model_validate(raw_response_dict)
-                    # 将 MCP SDK 的 ErrorData 转换为 A2A JSONRPCError
-                    return None, JSONRPCError(
-                        code=mcp_error_obj.error.code,
-                        message=mcp_error_obj.error.message,
-                        data=mcp_error_obj.error.data
-                    )
-                except Exception as val_err: # Pydantic validation error
+                    error_dict_for_a2a = {
+                        "code": mcp_error_obj.error.code,
+                        "message": mcp_error_obj.error.message,
+                        "data": mcp_error_obj.error.data
+                    }
+                    return None, JSONRPCError.model_validate(error_dict_for_a2a)
+                except Exception as val_err: 
                     logger.warning(f"MCP响应看似错误, 但mcp_types.JSONRPCError验证失败: {val_err}. 回退到原始解析。URL: {full_mcp_url}")
                     error_payload = raw_response_dict.get("error", {})
-                    return None, JSONRPCError(
-                        code=error_payload.get("code", mcp_types.INTERNAL_ERROR),
-                        message=error_payload.get("message", "未知的MCP错误结构"),
-                        data=error_payload.get("data")
-                    )
+                    fallback_error_dict = {
+                        "code": error_payload.get("code", mcp_types.INTERNAL_ERROR),
+                        "message": error_payload.get("message", "未知的MCP错误结构"),
+                        "data": error_payload.get("data")
+                    }
+                    return None, JSONRPCError.model_validate(fallback_error_dict)
             elif "result" in raw_response_dict and "id" in raw_response_dict:
                 try:
                     mcp_success_obj = mcp_types.JSONRPCResponse.model_validate(raw_response_dict)
@@ -268,27 +318,34 @@ class MCPGatewayAgentTaskManager(InMemoryTaskManager):
 
         except httpx.HTTPError as e:
             error_message = str(e)
-            status_code = e.response.status_code if e.response else None
-            logger.error(f"MCP HTTPError (状态码: {status_code}) 调用 {full_mcp_url}: {error_message}", exc_info=True)
-            return None, JSONRPCError(
-                code=status_code or mcp_types.INTERNAL_ERROR, # 使用HTTP状态码或通用内部错误码
-                message=error_message, 
-                data={"details": f"MCP调用期间发生HTTP/网络层错误 (URL: {full_mcp_url})"}
-            )
-        except ValueError as e: # JSON decoding error from mcp_client
+            status_code = None
+            # 安全地访问 e.response 和 e.response.status_code
+            if hasattr(e, 'response') and e.response is not None:
+                status_code = e.response.status_code
+            
+            logger.error(f"MCP HTTPError (状态码: {status_code if status_code else 'N/A'}) 调用 {full_mcp_url}: {error_message}", exc_info=True)
+            http_error_dict = {
+                "code": status_code or mcp_types.INTERNAL_ERROR,
+                "message": error_message, 
+                "data": {"details": f"MCP调用期间发生HTTP/网络层错误 (URL: {full_mcp_url})"}
+            }
+            return None, JSONRPCError.model_validate(http_error_dict)
+        except ValueError as e: 
             logger.error(f"MCP ValueError (JSON解码) 调用 {full_mcp_url}: {str(e)}", exc_info=True)
-            return None, JSONRPCError(
-                code=mcp_types.PARSE_ERROR,
-                message="MCP服务返回非JSON响应或格式错误的JSON。",
-                data={"details": str(e), "url": full_mcp_url}
-            )
-        except Exception as e: # Catch-all for other unexpected errors
+            value_error_dict = {
+                "code": mcp_types.PARSE_ERROR,
+                "message": "MCP服务返回非JSON响应或格式错误的JSON。",
+                "data": {"details": str(e), "url": full_mcp_url}
+            }
+            return None, JSONRPCError.model_validate(value_error_dict)
+        except Exception as e: 
             logger.error(f"MCP调用期间发生意外错误 {full_mcp_url}: {str(e)}", exc_info=True)
-            return None, JSONRPCError(
-                code=mcp_types.INTERNAL_ERROR,
-                message="与MCP服务通信时发生意外错误。",
-                data={"details": str(e), "url": full_mcp_url}
-            )
+            unexpected_error_dict = {
+                "code": mcp_types.INTERNAL_ERROR,
+                "message": "与MCP服务通信时发生意外错误。",
+                "data": {"details": str(e), "url": full_mcp_url}
+            }
+            return None, JSONRPCError.model_validate(unexpected_error_dict)
 
     def _format_a2a_result_from_mcp_response(self, mcp_response_data: Dict[str, Any], mcp_request_id_echo: Optional[str | int]) -> Tuple[TaskStatus, List[Artifact]]:
         """
@@ -313,7 +370,7 @@ class MCPGatewayAgentTaskManager(InMemoryTaskManager):
 
         status_message = Message(
             role="agent",
-            ports=[TextPart(text=status_message_text)]
+            parts=[TextPart(text=status_message_text)]
         )
 
         final_task_status = TaskStatus(

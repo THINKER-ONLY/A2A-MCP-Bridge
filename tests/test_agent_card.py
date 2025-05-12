@@ -33,8 +33,8 @@ def test_def_get_mcp_gateway_agent_card_default_version():
     assert isinstance(skill, AgentSkill)
     # 我们在之前的 review 中将 agent_card.py 中的 skill id 和 name 修改了
     # 以匹配 DESIGN.md。测试应该反映这些更改。
-    assert skill.id == "execute_mcp_command" 
-    assert skill.name == "Execute MCP Command"
+    assert skill.id == "execute_mcp_json_rpc"
+    assert skill.name == "Execute MCP JSON-RPC Method"
     assert "Executes a specified MCP JSON-RPC method" in skill.description
     assert skill.inputModes == ["data"]
     assert skill.outputModes == ["data"]

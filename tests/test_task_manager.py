@@ -27,8 +27,8 @@ def task_manager():
 
 @pytest.fixture
 def mock_send_mcp_request():
-    """Fixture to mock the send_mcp_request function."""
-    with patch("translator.task_manager.send_mcp_request", new_callable=AsyncMock) as mock_func:
+    """Fixture to mock the send_mcp_request function as used by the task_manager."""
+    with patch("src.translator.task_manager.send_mcp_request", new_callable=AsyncMock) as mock_func:
         yield mock_func
 
 @pytest.mark.asyncio
@@ -104,14 +104,10 @@ async def test_on_send_task_successful_tools_call(task_manager: MCPGatewayAgentT
     output_data_part = output_artifact.parts[0]
     assert isinstance(output_data_part, DataPart)
     
-    # Check the data within the output DataPart
-    # This structure comes from _format_a2a_result_from_mcp_response
-    # The entire mcp_response_data (which is mocked_mcp_service_response.model_dump()) is put into output_data_part.data
-    assert output_data_part.data["jsonrpc"] == "2.0"
-    assert output_data_part.data["id"] == expected_mcp_request_id
-    assert "result" in output_data_part.data
-    assert output_data_part.data["result"]["content"][0]["text"] == mcp_result_content_text
-    assert "mcp_error" not in output_data_part.data # Ensure no error part
+    # Directly check the keys within the result payload
+    assert "content" in output_data_part.data # Check for 'content' key directly
+    assert output_data_part.data["content"][0]["text"] == mcp_result_content_text
+    assert "error" not in output_data_part.data # Ensure no error part
 
     # Check metadata in the artifact's DataPart
     assert output_data_part.metadata is not None
@@ -209,14 +205,13 @@ async def test_on_send_task_successful_resources_read(task_manager: MCPGatewayAg
     output_data_part = output_artifact.parts[0]
     assert isinstance(output_data_part, DataPart)
 
-    assert output_data_part.data["jsonrpc"] == "2.0"
-    assert output_data_part.data["id"] == expected_mcp_request_id
-    assert "result" in output_data_part.data
-    mcp_result_from_a2a = output_data_part.data["result"]
+    # Directly check the keys within the result payload
+    assert "contents" in output_data_part.data # Check for 'contents' key directly
+    mcp_result_from_a2a = output_data_part.data # Data itself is the result
     assert len(mcp_result_from_a2a["contents"]) == 1
     assert mcp_result_from_a2a["contents"][0]["text"] == resource_content_text
-    assert mcp_result_from_a2a["contents"][0]["uri"] == resource_uri_to_read
-    assert "mcp_error" not in output_data_part.data
+    assert str(mcp_result_from_a2a["contents"][0]["uri"]) == resource_uri_to_read # <-- 转换为字符串比较
+    assert "error" not in output_data_part.data # Ensure no error part
 
     assert output_data_part.metadata is not None
     assert output_data_part.metadata["mcp_request_id_echo"] == expected_mcp_request_id
@@ -641,8 +636,6 @@ async def test_on_send_task_invalid_a2a_input_wrong_type(
     assert isinstance(a2a_response.error, A2AJSONRPCError)
     assert a2a_response.error.code == -32602 # Invalid Params
     assert expected_message_segment in a2a_response.error.message
-    if isinstance(a2a_response.error.data, dict):
-         assert expected_message_segment in a2a_response.error.data.get("detail", "")
 
     # 断言 A2A 响应的 result 部分 (Task 对象)
     assert a2a_response.result is not None

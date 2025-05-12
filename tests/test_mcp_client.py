@@ -8,7 +8,8 @@ import json # 确保导入 json 以便在测试中使用 json.JSONDecodeError
 from src.translator.mcp_client import send_mcp_request
 
 @pytest.mark.asyncio
-async def test_send_mcp_request_successful():
+@patch("src.translator.mcp_client.httpx.AsyncClient")
+async def test_send_mcp_request_successful(mock_async_client_constructor: AsyncMock):
     """
     测试 send_mcp_request 在成功 HTTP 调用并返回有效 JSON 时的行为。
     """
@@ -25,43 +26,38 @@ async def test_send_mcp_request_successful():
     # raise_for_status 在成功时不抛出异常
     mock_response.raise_for_status = MagicMock()
 
-    mock_async_client_instance = AsyncMock(spec=httpx.AsyncClient)
-    mock_async_client_instance.post.return_value = mock_response
-
-    # 使用 patch 来替换 httpx.AsyncClient 的上下文管理器行为
-    with patch("httpx.AsyncClient", return_value=mock_async_client_instance) as mock_async_client_constructor:
-        actual_response = await send_mcp_request(
-            target_url=target_url,
-            mcp_json_rpc_request_dict=request_dict,
-            headers=custom_headers,
-            timeout=timeout_val
-        )
-
-    # 断言 AsyncClient 是否被正确调用
-    mock_async_client_constructor.assert_called_once()
+    mock_client_instance = AsyncMock()
+    mock_client_instance.post.return_value = mock_response
+    mock_client_instance.__aenter__.return_value = mock_client_instance
     
-    # 断言 client.post 是否以预期参数被调用
-    mock_async_client_instance.post.assert_called_once_with(
+    # Make the constructor return our mocked client instance
+    mock_async_client_constructor.return_value = mock_client_instance
+
+    actual_response = await send_mcp_request(
+        target_url=target_url,
+        mcp_json_rpc_request_dict=request_dict,
+        headers=custom_headers,
+        timeout=timeout_val
+    )
+
+    mock_async_client_constructor.assert_called_once_with(timeout=timeout_val, follow_redirects=True)
+    mock_client_instance.post.assert_awaited_once_with(
         target_url,
         json=request_dict,
         headers={
             "Content-Type": "application/json",
             **custom_headers
-        },
-        timeout=timeout_val
+        }
     )
-    
-    # 断言 response.raise_for_status() 被调用
     mock_response.raise_for_status.assert_called_once()
-    
-    # 断言 response.json() 被调用
     mock_response.json.assert_called_once()
     
     # 断言函数返回了预期的字典
     assert actual_response == expected_response_dict
 
 @pytest.mark.asyncio
-async def test_send_mcp_request_http_status_error_with_json_error_body():
+@patch("src.translator.mcp_client.httpx.AsyncClient")
+async def test_send_mcp_request_http_status_error_with_json_error_body(mock_async_client_constructor: AsyncMock):
     """
     测试当 HTTP 调用返回状态错误 (如 500)，且响应体包含有效的 JSON 错误信息时，
     send_mcp_request 是否能正确解析该 JSON 错误并重新抛出包含该信息的 HTTPError。
@@ -88,31 +84,31 @@ async def test_send_mcp_request_http_status_error_with_json_error_body():
         )
     )
 
-    mock_async_client_instance = AsyncMock(spec=httpx.AsyncClient)
-    mock_async_client_instance.post.return_value = mock_response
+    mock_client_instance = AsyncMock()
+    mock_client_instance.post.return_value = mock_response
+    mock_client_instance.__aenter__.return_value = mock_client_instance
+    mock_async_client_constructor.return_value = mock_client_instance
 
-    with patch("httpx.AsyncClient", return_value=mock_async_client_instance):
-        with pytest.raises(httpx.HTTPError) as exc_info:
-            await send_mcp_request(
-                target_url=target_url,
-                mcp_json_rpc_request_dict=request_dict
-            )
+    with pytest.raises(httpx.HTTPError) as exc_info:
+        await send_mcp_request(
+            target_url=target_url,
+            mcp_json_rpc_request_dict=request_dict
+        )
     
     # 断言抛出的异常
     assert exc_info.value.response == mock_response
     assert exc_info.value.request == mock_response.request
-    # send_mcp_request 应该从 JSON body 中提取错误消息
-    expected_error_message_from_json = json_error_payload["error"]["message"]
-    assert str(exc_info.value) == f"HTTP {status_code}: {expected_error_message_from_json}"
+    # send_mcp_request 不再格式化消息，而是重新抛出原始异常
+    # 因此，断言消息应为原始消息
+    assert str(exc_info.value) == original_http_error_message
 
-    # 确保 post 和 raise_for_status 被调用
-    mock_async_client_instance.post.assert_called_once()
+    mock_client_instance.post.assert_awaited_once()
     mock_response.raise_for_status.assert_called_once()
-    # 确保 response.json() 在这种情况下也被调用了（因为要尝试解析错误体）
     mock_response.json.assert_called_once()
 
 @pytest.mark.asyncio
-async def test_send_mcp_request_http_status_error_non_json_body():
+@patch("src.translator.mcp_client.httpx.AsyncClient")
+async def test_send_mcp_request_http_status_error_non_json_body(mock_async_client_constructor: AsyncMock):
     """
     测试当 HTTP 调用返回状态错误 (如 404)，且响应体不是有效的 JSON (或不含预期错误结构) 时，
     send_mcp_request 抛出的 HTTPError 的行为。
@@ -138,15 +134,16 @@ async def test_send_mcp_request_http_status_error_non_json_body():
         )
     )
 
-    mock_async_client_instance = AsyncMock(spec=httpx.AsyncClient)
-    mock_async_client_instance.post.return_value = mock_response
+    mock_client_instance = AsyncMock()
+    mock_client_instance.post.return_value = mock_response
+    mock_client_instance.__aenter__.return_value = mock_client_instance
+    mock_async_client_constructor.return_value = mock_client_instance
 
-    with patch("httpx.AsyncClient", return_value=mock_async_client_instance):
-        with pytest.raises(httpx.HTTPStatusError) as exc_info: # 捕获原始或重新抛出的 HTTPStatusError
-            await send_mcp_request(
-                target_url=target_url,
-                mcp_json_rpc_request_dict=request_dict
-            )
+    with pytest.raises(httpx.HTTPStatusError) as exc_info: # 捕获原始或重新抛出的 HTTPStatusError
+        await send_mcp_request(
+            target_url=target_url,
+            mcp_json_rpc_request_dict=request_dict
+        )
     
     # 断言抛出的异常
     # 在这种情况下，因为 response.json() 会失败 (或者没有找到 'error' 键)，
@@ -156,12 +153,13 @@ async def test_send_mcp_request_http_status_error_non_json_body():
     assert exc_info.value.request == mock_response.request
     assert str(exc_info.value) == original_http_error_message # 消息应为原始 HTTP 错误消息
 
-    mock_async_client_instance.post.assert_called_once()
+    mock_client_instance.post.assert_awaited_once()
     mock_response.raise_for_status.assert_called_once()
     mock_response.json.assert_called_once() # json() 仍然会被尝试调用
 
 @pytest.mark.asyncio
-async def test_send_mcp_request_connect_error():
+@patch("src.translator.mcp_client.httpx.AsyncClient")
+async def test_send_mcp_request_connect_error(mock_async_client_constructor: AsyncMock):
     """
     测试当 httpx.AsyncClient.post 抛出 ConnectError (一种 RequestError) 时，
     send_mcp_request 是否直接向上抛出该异常。
@@ -171,28 +169,29 @@ async def test_send_mcp_request_connect_error():
     connect_error_message = "Connection refused"
 
     # 模拟 AsyncClient 和它的 post 方法抛出 ConnectError
-    mock_async_client_instance = AsyncMock(spec=httpx.AsyncClient)
+    mock_client_instance = AsyncMock()
     # httpx.Request 对象是 ConnectError 所需的
     mock_request_obj = httpx.Request(method="POST", url=target_url)
-    mock_async_client_instance.post.side_effect = httpx.ConnectError(connect_error_message, request=mock_request_obj)
+    mock_client_instance.post.side_effect = httpx.ConnectError(connect_error_message, request=mock_request_obj)
 
-    with patch("httpx.AsyncClient", return_value=mock_async_client_instance) as mock_async_client_constructor:
-        with pytest.raises(httpx.ConnectError) as exc_info:
-            await send_mcp_request(
-                target_url=target_url,
-                mcp_json_rpc_request_dict=request_dict
-            )
+    mock_client_instance.__aenter__.return_value = mock_client_instance
+    mock_async_client_constructor.return_value = mock_client_instance
+
+    with pytest.raises(httpx.ConnectError) as exc_info:
+        await send_mcp_request(
+            target_url=target_url,
+            mcp_json_rpc_request_dict=request_dict
+        )
     
     # 断言抛出的异常是预期的 ConnectError
     assert str(exc_info.value) == connect_error_message
     assert exc_info.value.request == mock_request_obj
 
-    # 确保 AsyncClient 被构造且 post 被调用
-    mock_async_client_constructor.assert_called_once()
-    mock_async_client_instance.post.assert_called_once()
+    mock_client_instance.post.assert_awaited_once()
 
 @pytest.mark.asyncio
-async def test_send_mcp_request_response_not_json():
+@patch("src.translator.mcp_client.httpx.AsyncClient")
+async def test_send_mcp_request_response_not_json(mock_async_client_constructor: AsyncMock):
     """
     测试当 HTTP 调用成功 (200 OK) 但响应体不是有效 JSON 时，
     send_mcp_request 是否因 response.json() 调用而抛出 ValueError (或 JSONDecodeError)。
@@ -206,20 +205,21 @@ async def test_send_mcp_request_response_not_json():
     mock_response.json.side_effect = json.JSONDecodeError("Expecting value", "<HTML><body>Not JSON</body></HTML>", 0)
     mock_response.raise_for_status = MagicMock() # 成功时不抛出
 
-    mock_async_client_instance = AsyncMock(spec=httpx.AsyncClient)
-    mock_async_client_instance.post.return_value = mock_response
+    mock_client_instance = AsyncMock()
+    mock_client_instance.post.return_value = mock_response
+    mock_client_instance.__aenter__.return_value = mock_client_instance
+    mock_async_client_constructor.return_value = mock_client_instance
 
-    with patch("httpx.AsyncClient", return_value=mock_async_client_instance):
-        with pytest.raises((ValueError, json.JSONDecodeError)) as exc_info: # httpx 可能直接抛出 JSONDecodeError
-            await send_mcp_request(
-                target_url=target_url,
-                mcp_json_rpc_request_dict=request_dict
-            )
+    with pytest.raises((ValueError, json.JSONDecodeError)) as exc_info: # httpx 可能直接抛出 JSONDecodeError
+        await send_mcp_request(
+            target_url=target_url,
+            mcp_json_rpc_request_dict=request_dict
+        )
     
     # 简单的断言，确保是 JSON 解码相关的错误
     assert "Expecting value" in str(exc_info.value)
 
-    mock_async_client_instance.post.assert_called_once()
+    mock_client_instance.post.assert_awaited_once()
     mock_response.raise_for_status.assert_called_once()
     mock_response.json.assert_called_once()
 
