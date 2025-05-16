@@ -1,0 +1,8 @@
+# Dependencies for running the examples in this directory
+
+# For the A2A client (call_adapter.py)
+httpx>=0.25.0 # Or a version compatible with your project
+ 
+# For the mock MCP server (service.py)
+fastapi>=0.100.0 # Or a version compatible with your project
+uvicorn[standard]>=0.20.0 # Includes standard dependencies like watchfiles for potential reload 

@@ -36,109 +36,215 @@ class MCPGatewayAgentTaskManager(InMemoryTaskManager):
     发送到目标 MCP 服务，并将 MCP 响应格式化回 A2A 任务结果。
     """
 
-    async def on_send_task(self, request: SendTaskRequest) -> SendTaskResponse:
-        # 步骤 0: 立即通过 upsert_task 创建或获取任务，确保它在后续操作中存在
-        # upsert_task 会处理任务的初始创建 (状态 SUBMITTED) 和存储，或获取现有任务
+    # 首先定义辅助方法
+    def _format_a2a_error_response(self, request_id: Optional[str], code: int, message: str, data: Optional[Any] = None) -> JSONRPCError:
+        """辅助方法，用于创建 JSONRPCError 对象。"""
+        # request_id 参数在此实现中未使用，因为错误对象本身不包含请求ID。
+        # 请求ID属于顶层的 JSONRPCResponse。
+        return JSONRPCError(code=code, message=message, data=data)
+
+    async def on_send_task(self, request: SendTaskRequest) -> A2AJSONRPCResponse:
+        self.task_id = request.params.id
+        self.session_id = request.params.sessionId
+        self.last_error = None # Reset last_error for this new task
+
+        logger.info(f"任务 [{self.task_id}] (会话 [{self.session_id}]): 已接收")
+
+        # 步骤 1: 立即通过 upsert_task 创建或获取任务，确保它在后续操作中存在
         try:
-            # 我们期望 request.params (类型为 TaskSendParams) 中有所有需要的信息
-            # upsert_task 来自 InMemoryTaskManager
-            initial_task = await self.upsert_task(request.params)
-            task_id = initial_task.id
-            session_id = initial_task.sessionId
+            # InMemoryTaskManager.upsert_task 期望 TaskSendParams，并自行处理初始状态
+            await self.upsert_task(request.params) 
+            logger.info(f"任务 [{self.task_id}]: 已通过 upsert_task 创建/获取，初始状态为 SUBMITTED。")
         except Exception as e:
-            logger.error(f"在 upsert_task 时发生严重错误 (ID: {request.params.id}): {str(e)}", exc_info=True)
-            return SendTaskResponse(
+            logger.error(f"任务 [{self.task_id}]: 在 upsert_task 时发生严重错误: {e}", exc_info=True)
+            json_rpc_error = self._format_a2a_error_response(
+                request_id=request.id, #传递以备将来使用，但当前不由_format_a2a_error_response使用
+                code=-32002, 
+                message=f"Failed to initialize task in store: {str(e)}"
+            )
+            return A2AJSONRPCResponse(
                 id=request.id,
-                error=JSONRPCError(
-                    code=mcp_types.INTERNAL_ERROR,
-                    message="任务存储失败",
-                    data={"detail": str(e)}
-                ),
-                result=Task(
-                    id=request.params.id,
-                    sessionId=request.params.sessionId,
-                    status=TaskStatus(state=TaskState.FAILED, message=Message(role="agent", parts=[TextPart(text="任务初始存储失败。")])),
-                    history=[request.params.message.model_copy(deep=True) if request.params.message else Message(role="user", parts=[TextPart(text="<原始消息不可用>")])]
-                )
+                error=json_rpc_error.model_dump(exclude_none=True)
             )
 
-        # incoming_message 仍然可以直接从 request.params.message 获取，供后续解析使用
-        incoming_message = request.params.message
-
-        logger.info(f"任务 [{task_id}] (会话 [{session_id}]): 已接收并初步存储。正在处理...")
-        # ---------- 工作流步骤 ----------
-
-        # 步骤 1: 解析并验证 A2A 输入
-        # 目标: 从 incoming_message.parts[0].data 中提取 MCP 调用参数
-        # 输出: mcp_调用参数字典 (mcp_call_params_dict) 或一个 A2A 错误对象 (error_for_a2a)
-        parsed_input, extraction_error = self._parse_a2a_input(incoming_message)
+        # 步骤 2: 解析输入
+        # _parse_a2a_input 应该返回 Tuple[Optional[Dict[str, Any]], Optional[JSONRPCError]]
+        # 如果解析失败，它返回 (None, JSONRPCError_object)
+        # 如果成功，它返回 (parsed_params_dict, None)
+        # 我们需要将这些解析后的参数存储在实例变量中，供后续方法使用
         
-        if extraction_error:
-            logger.error(f"任务 [{task_id}]: 解析 A2A 输入失败。错误: {extraction_error.message}")
-            failed_status = TaskStatus(
-                state = TaskState.FAILED,
-                message = Message(
-                    role = "agent",
-                    parts=[DataPart(data={"error_summary": "无效的 A2A 任务输入。", "detail": extraction_error.model_dump()})],
-                )
+        parsed_params_dict, parsing_json_rpc_error = await self._parse_a2a_input(request)
+
+        if parsing_json_rpc_error:
+            logger.warning(f"任务 [{self.task_id}]: A2A 输入解析失败: {parsing_json_rpc_error.message}")
+            
+            # 使用现有的 _format_a2a_result_on_error
+            # 它期望一个包含 "code", "message", "data" 的字典作为 error_details
+            error_details_for_formatter = parsing_json_rpc_error.model_dump()
+
+            # _format_a2a_result_on_error 返回 (TaskStatus, List[Artifact])
+            failed_status, failed_artifacts = self._format_a2a_result_on_error(
+                mcp_call_error_details=error_details_for_formatter,
+                mcp_request_id_echo=None # No MCP request was made yet
             )
-            updated_task = await self.update_store(task_id, failed_status, [])
-            return SendTaskResponse(id=request.id, result=updated_task, error=extraction_error)
-        
-        mcp_target_url = parsed_input["mcp_target_url"]
-        mcp_request_path = parsed_input["mcp_request_path"]
-        mcp_method_to_call = parsed_input["mcp_method"]
-        mcp_params_for_call = parsed_input["mcp_params"]
-        original_mcp_request_id = parsed_input.get("mcp_request_id")
+            
+            # 尝试的修改: 对 history 中的 Message 进行 dump 和 re-validate
+            re_validated_message_on_parse_error = None
+            if request.params.message:
+                message_dict_on_parse_error = request.params.message.model_dump(exclude_none=True, by_alias=True)
+                try:
+                    re_validated_message_on_parse_error = Message.model_validate(message_dict_on_parse_error)
+                except Exception as e_val:
+                    logger.error(f"任务 [{self.task_id}]: 重新验证 history message (解析错误路径) 时出错: {e_val}", exc_info=True)
+                    re_validated_message_on_parse_error = request.params.message # Fallback
+            
+            task_history_on_parse_error = [re_validated_message_on_parse_error] if re_validated_message_on_parse_error else []
 
-        # 步骤 2: 构建 MCP JSON-RPC 请求体  
-        # 目标: 构造用于 MCP HTTP POST 请求的字典负载。
-        # 输出: mcp_请求体字典 (mcp_request_body_dict)
-        mcp_request_body = self._build_mcp_request_body(
-            method=mcp_method_to_call,
-            params=mcp_params_for_call,
-            request_id=original_mcp_request_id
-        )
-        mcp_request_id_sent = mcp_request_body.get("id")
-
-        # 步骤 3 & 4: 执行 MCP 调用 (发送请求和接收响应)
-        # 目标: 使用 mcp_client.send_mcp_request 与目标 MCP 服务通信。
-        # 输出: mcp_响应负载字典 (mcp_response_payload_dict) 或一个 A2A 错误对象 (error_for_a2a)
-        logger.info(f"任务 [{task_id}]: 准备发送 MCP 请求 '{mcp_method_to_call}' 到 {mcp_target_url}{mcp_request_path}")
-        mcp_response_payload, mcp_call_error = await self._execute_mcp_call(
-            target_base_url = mcp_target_url,
-            request_path = mcp_request_path,
-            mcp_request_body = mcp_request_body
-        )
-
-        if mcp_call_error:
-            logger.error(f"任务 [{task_id}]: MCP 调用失败。错误: {mcp_call_error.message}")
-            failed_status, artifacts_with_error = self._format_a2a_result_on_error(
-                mcp_call_error_details=mcp_call_error.model_dump(),
-                mcp_request_id_echo=mcp_request_id_sent
+            # 创建 Task 对象
+            task_result_obj = Task(
+                id=self.task_id,
+                sessionId=self.session_id,
+                status=failed_status,
+                artifacts=failed_artifacts,
+                history=task_history_on_parse_error
             )
-            updated_task = await self.update_store(task_id, failed_status, artifacts_with_error)
-            return SendTaskResponse(id=request.id, result=updated_task, error=mcp_call_error)
+            
+            await self.update_store(
+                 task_id=task_result_obj.id,
+                 status=task_result_obj.status,
+                 artifacts=task_result_obj.artifacts if task_result_obj.artifacts else []
+            )
+            send_task_response_payload = SendTaskResponse(result=task_result_obj)
+            return A2AJSONRPCResponse(id=request.id, result=send_task_response_payload.model_dump(exclude_none=True))
         
-        # 步骤 5: 从 MCP 响应格式化 A2A 任务结果
-        # 目标: 将成功的 (或 MCP 层面错误的) mcp_response_payload 转换为 A2A TaskStatus 和 Artifacts。
-        # 输出: final_task_status, list_of_artifacts
-        logger.info(f"任务 [{task_id}]: MCP 调用成功 (或 MCP 返回了结构化错误)。正在格式化 A2A 结果。")
-        final_task_status, final_artifacts = self._format_a2a_result_from_mcp_response(
-            mcp_response_data=mcp_response_payload, # 这个字典包含来自 MCP 的 "result" 或 "error"
-            mcp_request_id_echo=mcp_request_id_sent
-        )
-        
-        # 步骤 6: 更新任务存储并返回 A2A 响应
-        logger.info(f"任务 [{task_id}]: 最终 A2A 状态: {final_task_status.state}。正在更新存储。")
-        updated_task = await self.update_store(
-            task_id,
-            final_task_status,
-            final_artifacts
-        )
-        return SendTaskResponse(id=request.id, result=updated_task, error=None)
+        # 如果解析成功，设置实例变量供后续方法（如 _execute_mcp_call, _build_mcp_request_body）使用
+        self.mcp_target_url = parsed_params_dict["mcp_target_url"]
+        self.mcp_request_path = parsed_params_dict["mcp_request_path"]
+        self.mcp_method = parsed_params_dict["mcp_method"]
+        self.mcp_params = parsed_params_dict["mcp_params"]
+        self.mcp_request_id = parsed_params_dict.get("mcp_request_id") # .get 因为它是可选的
 
-    def _parse_a2a_input(self, message: Message) -> Tuple[Optional[Dict[str, Any]], Optional[JSONRPCError]]:
+        logger.info(f"任务 [{self.task_id}]: A2A 输入成功解析。准备执行 MCP 调用。")
+        status_after_parse = TaskStatus(
+            state=TaskState.WORKING,
+            progress=0.1,
+            message=Message(role="agent", parts=[TextPart(text="A2A input parsed. Preparing MCP call.")])
+        )
+        await self.update_store(task_id=self.task_id, status=status_after_parse, artifacts=[])
+
+        # 步骤 3: 执行 MCP 调用
+        mcp_result, mcp_error_details = await self._execute_mcp_call()
+        mcp_call_successful = mcp_result is not None and mcp_error_details is None
+
+        if mcp_call_successful:
+            logger.info(f"任务 [{self.task_id}]: MCP 调用成功。")
+            status_after_mcp_success = TaskStatus(
+                state=TaskState.WORKING,
+                progress=0.7, 
+                message=Message(role="agent", parts=[TextPart(text="MCP call successful, formatting A2A result.")])
+            )
+            await self.update_store(task_id=self.task_id, status=status_after_mcp_success, artifacts=[])
+            successful_status, successful_artifacts = self._format_a2a_result_from_mcp_response(mcp_result, self.mcp_request_id)
+            
+            # 尝试的修改: 对 history 中的 Message 进行 dump 和 re-validate
+            re_validated_message_on_success = None
+            if request.params.message:
+                message_dict_on_success = request.params.message.model_dump(exclude_none=True, by_alias=True)
+                try:
+                    re_validated_message_on_success = Message.model_validate(message_dict_on_success)
+                except Exception as e_val:
+                    logger.error(f"任务 [{self.task_id}]: 重新验证 history message (成功路径) 时出错: {e_val}", exc_info=True)
+                    re_validated_message_on_success = request.params.message # Fallback
+
+            task_history_on_success = [re_validated_message_on_success] if re_validated_message_on_success else []
+            
+            task_result_obj = Task(
+                id=self.task_id,
+                sessionId=self.session_id,
+                status=successful_status,
+                artifacts=successful_artifacts,
+                history=task_history_on_success
+            )
+        else:
+            logger.error(f"任务 [{self.task_id}]: MCP 调用失败或返回错误。详细信息: {mcp_error_details}")
+            error_code = "mcp_call_failed"
+            error_message = str(mcp_error_details)
+            error_data = None
+            if isinstance(mcp_error_details, dict):
+                error_message = mcp_error_details.get("message", error_message)
+                error_code = str(mcp_error_details.get("code", error_code))
+                error_data = mcp_error_details.get("data")
+            
+            status_on_mcp_fail, artifacts_on_mcp_fail = self._format_a2a_result_on_error(
+                 mcp_call_error_details=mcp_error_details if isinstance(mcp_error_details, dict) else {"code": error_code, "message": error_message, "data": error_data},
+                 mcp_request_id_echo=self.mcp_request_id
+            )
+            await self.update_store(task_id=self.task_id, status=status_on_mcp_fail, artifacts=artifacts_on_mcp_fail)
+            task_result_obj = await self.get_task(self.task_id)
+            if task_result_obj is None: # Should not happen if update_store succeeded
+                # 尝试的修改: 对 history 中的 Message 进行 dump 和 re-validate (错误路径中的 fallback)
+                re_validated_message_on_mcp_fail_fallback = None
+                if request.params.message: # request 可能不存在于此更深层的作用域，假设它仍然可访问或使用类属性
+                    message_dict_on_mcp_fail_fallback = request.params.message.model_dump(exclude_none=True, by_alias=True)
+                    try:
+                        re_validated_message_on_mcp_fail_fallback = Message.model_validate(message_dict_on_mcp_fail_fallback)
+                    except Exception as e_val:
+                        logger.error(f"任务 [{self.task_id}]: 重新验证 history message (MCP失败回退路径) 时出错: {e_val}", exc_info=True)
+                        re_validated_message_on_mcp_fail_fallback = request.params.message # Fallback
+                
+                task_history_on_mcp_fail_fallback = [re_validated_message_on_mcp_fail_fallback] if re_validated_message_on_mcp_fail_fallback else []
+
+                task_result_obj = Task(id=self.task_id, sessionId=self.session_id, status=status_on_mcp_fail, artifacts=artifacts_on_mcp_fail, history=task_history_on_mcp_fail_fallback)
+
+        if task_result_obj is None: # Fallback
+            logger.error(f"任务 [{self.task_id}]: 未能格式化有效的 Task 对象。使用通用错误。")
+            # 为了安全，如果进入此分支，history 保持为空。
+            
+            # 修正：下面的调用是错误的，_format_a2a_result_on_error 期望字典
+            # general_failed_status, general_failed_artifacts = self._format_a2a_result_on_error(
+            #     {"code": "internal_formatting_error", "message": "Internal error: Failed to format A2A result."} # 示例错误字典
+            # )
+            # task_result_obj = Task(
+            #     id=self.task_id, 
+            #     sessionId=self.session_id, 
+            #     status=general_failed_status, 
+            #     artifacts=general_failed_artifacts, 
+            #     history=[] # 在这种通用错误情况下，history 为空
+            # )
+
+            # 保持原有逻辑，仅在task_result_obj已存在但history可能需要处理时考虑
+            # 但如果 task_result_obj 本身是 None，则创建它，此时 history 保持为空
+            general_failed_status = TaskStatus(state=TaskState.FAILED, message=Message(role="agent", parts=[TextPart(text="Internal error: Failed to format A2A result.")]))
+            task_result_obj = Task(
+                id=self.task_id,
+                sessionId=self.session_id,
+                status=general_failed_status,
+                artifacts=[], # No specific artifacts for this generic error
+                history=[] # Keep history empty for this very generic fallback
+            )
+        
+        # 步骤 4: 更新存储并返回最终响应
+        final_status_to_log = task_result_obj.status.state.value if task_result_obj.status else TaskState.UNKNOWN.value
+        logger.info(f"任务 [{self.task_id}]: 最终任务状态为 {final_status_to_log}。准备更新存储并发送响应。")
+        await self.update_store(
+            task_id=task_result_obj.id, 
+            status=task_result_obj.status, 
+            artifacts=task_result_obj.artifacts if task_result_obj.artifacts else []
+        )
+        
+        # 构建 SendTaskResponse 实例，其 id 为原始请求的 id，result 为 Task 对象
+        send_task_response_obj = SendTaskResponse(
+            id=request.id, # 使用原始请求的 ID
+            result=task_result_obj # result 是 Task 实例
+        )
+
+        # 使用 SendTaskResponse 实例自身的 model_dump_json 用于调试日志
+        logger.debug(f"任务 [{self.task_id}]: 最终响应对象 (SendTaskResponse): {send_task_response_obj.model_dump_json(exclude_none=True, indent=2)}")
+        
+        #直接返回 SendTaskResponse 实例
+        return send_task_response_obj
+
+    async def _parse_a2a_input(self, request: SendTaskRequest) -> Tuple[Optional[Dict[str, Any]], Optional[JSONRPCError]]:
         """
         解析传入的 A2A Message 以提取 MCP 调用参数。
         如果解析失败，返回参数字典或一个 JSONRPCError。
@@ -150,14 +256,14 @@ class MCPGatewayAgentTaskManager(InMemoryTaskManager):
             - "mcp_request_id": str | int (可选)
         """
         try:
-            if not message.parts or len(message.parts) == 0:
+            if not request.params.message.parts or len(request.params.message.parts) == 0:
                 return None, JSONRPCError(
                     code=-32602,
                     message="消息必须包含至少一个部分",
                     data={"detail": "Message must contain at least one part"}
                 )
 
-            first_part = message.parts[0]
+            first_part = request.params.message.parts[0]
             
             # 修改检查逻辑：
             # 1. 检查 'type' 属性是否存在且等于 'data'
@@ -227,7 +333,7 @@ class MCPGatewayAgentTaskManager(InMemoryTaskManager):
                 "mcp_target_url": data_payload["mcp_target_url"],
                 "mcp_method": data_payload["mcp_method"],
                 "mcp_params": data_payload["mcp_params"],
-                "mcp_request_path": data_payload.get("mcp_request_path", "/messages/"),
+                "mcp_request_path": data_payload.get("mcp_request_path", ""),
                 "mcp_request_id": data_payload.get("mcp_request_id")
             }
             return params, None
@@ -257,22 +363,53 @@ class MCPGatewayAgentTaskManager(InMemoryTaskManager):
         # exclude_none=True 确保可选字段为 None 时不包含在输出字典中
         return mcp_req_obj.model_dump(exclude_none=True)
 
-    async def _execute_mcp_call(self, target_base_url: str, request_path: str, mcp_request_body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[JSONRPCError]]:
+    async def _execute_mcp_call(self) -> Tuple[Optional[Dict[str, Any]], Optional[JSONRPCError]]:
         """
         使用 mcp_client 发送 MCP 请求并处理 HTTP/网络错误。
         返回 MCP 响应的 result 部分 (字典) 或一个用于 A2A 的 JSONRPCError。
         """
-        # 确保 target_base_url 总是以单个斜杠结尾，然后附加 request_path
-        # 这有助于避免双斜杠或缺少斜杠的问题
-        if not target_base_url.endswith("/"):
-            target_base_url += "/"
+        # 这些 self. 属性应该由 on_send_task 在调用此方法前通过 _parse_a2a_input 的结果设置
+        current_mcp_target_url = self.mcp_target_url 
+        current_mcp_request_path = self.mcp_request_path
+
+        full_mcp_url = current_mcp_target_url 
+        if current_mcp_request_path: # 仅当 current_mcp_request_path 非空时才进行拼接
+            processed_target_url = current_mcp_target_url.rstrip('/')
+            processed_request_path = current_mcp_request_path
+            if not processed_request_path.startswith('/'):
+                processed_request_path = '/' + processed_request_path
+            full_mcp_url = f"{processed_target_url}{processed_request_path}"
         
-        # request_path 通常以 / 开头，但也可能不是，所以 lstrip 一下以防万一
-        # 如果 request_path 为空或 "/"，urljoin 的行为可能更可预测，但这里简化处理
-        full_mcp_url = target_base_url + request_path.lstrip("/")
+        # mcp_request_body 也应从 self. 属性或参数获取，这里假设 on_send_task 会准备好 self.mcp_request_body
+        # 或者 _build_mcp_request_body 使用 self. 属性
+        # 为了与现有代码兼容，我们假设 _build_mcp_request_body 使用 self.mcp_method, self.mcp_params, self.mcp_request_id
+        # 而这些 self. 属性是在 on_send_task 中，在调用 _execute_mcp_call 之前，从 _parse_a2a_input 的结果中设置的。
+        # 注意: 原代码中 _build_mcp_request_body 接收参数，_execute_mcp_call 中并没有直接使用 self.mcp_request_body
+        # 这里我们需要确保 mcp_request_body 被正确构建并传递给 send_mcp_request
+        # 假设 on_send_task 的逻辑是: 
+        #   parsed_data = await self._parse_a2a_input(...)
+        #   self.mcp_target_url = parsed_data["mcp_target_url"]
+        #   ...
+        #   self.mcp_request_body_dict = self._build_mcp_request_body(self.mcp_method, self.mcp_params, self.mcp_request_id)
+        #   result, error = await self._execute_mcp_call() <-- _execute_mcp_call 现在可以不接收参数，直接用 self. 属性
+        # 或者，保持 _execute_mcp_call 接收参数，但 on_send_task 要正确传递它们。
+        # 为了最小化改动并与您提供的 _execute_mcp_call 签名一致，它不接收这些参数。
+        # 因此，它必须依赖于 self.mcp_method, self.mcp_params, self.mcp_request_id 被设置。
+        
+        # 构建请求体，这里假设 _build_mcp_request_body 使用实例变量
+        # (这与您当前代码中 _build_mcp_request_body 的签名不同，它接收参数)
+        # 为了匹配 _execute_mcp_call 的逻辑，我们需要在 on_send_task 中先调用 _build_mcp_request_body
+        # 并将其结果 (一个字典) 传递给 _execute_mcp_call，或者让 _execute_mcp_call 内部调用它。
+        
+        # 我们将遵循 _execute_mcp_call 内部构建 request_body 的模式，假设相关 self 属性已设置
+        mcp_http_request_body = self._build_mcp_request_body(
+            method=self.mcp_method, 
+            params=self.mcp_params, 
+            request_id=self.mcp_request_id
+        )
 
         try:
-            raw_response_dict = await send_mcp_request(full_mcp_url, mcp_request_body)
+            raw_response_dict = await send_mcp_request(full_mcp_url, mcp_http_request_body)
 
             # 尝试将响应解析为 MCP JSON-RPC 错误或成功响应
             # MCP 服务对于 JSON-RPC 级别的错误通常也返回 HTTP 200 OK

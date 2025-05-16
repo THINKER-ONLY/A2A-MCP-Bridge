@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from vendor.A2A.server import A2AServer
 from vendor.A2A.types import AgentCard, AgentCapabilities, AgentSkill
 from .task_manager import MCPGatewayAgentTaskManager
+from .agent_card import def_get_mcp_gateway_agent_card
 
 load_dotenv()
 
@@ -20,26 +21,7 @@ def main(host: str, port: int):
     """启动 MCPGatewayAgent 服务器。"""
     logger.info(f"MCPGatewayAgent 准备启动于 http://{host}:{port}")
 
-    capabilities = AgentCapabilities(streaming=False, pushNotifications=False)
-
-    skill = AgentSkill(
-        id="execute_mcp_command",
-        name="Execute MCP Command",
-        description="在目标 MCP 服务上使用给定参数执行指定的 MCP JSON-RPC 方法。命令详细信息在输入的 DataPart 中提供。",
-        inputModes=["data"],
-        outputModes=["data"],
-    )
-
-    agent_card_instance = AgentCard(
-        name="MCP Gateway Agent",
-        description="一个通用的 A2A 代理，充当网关，用于将请求转发到任何符合 MCP 规范的服务并接收其响应。",
-        url=f"http://{host}:{port}/",
-        version="0.1.0",
-        capabilities=capabilities,
-        skills=[skill],
-        defaultInputModes=["data"],
-        defaultOutputModes=["data"],
-    )
+    agent_card_instance = def_get_mcp_gateway_agent_card(host=host, port=port)
 
     task_manager_instance = MCPGatewayAgentTaskManager()
 
